@@ -20,6 +20,43 @@ const T:{[k:number]:[number,number,number]}={
   0x34:[0,0,0],0x40:[0,1,1],0x41:[0,2,0],0x50:[0,1,0],0x51:[0,1,0],
   0x52:[0,0,1],0x53:[0,1,0]};
 
+// Read the immediate operand of the instruction at offset i: the opcode
+// decides its width and signedness (PUSH8 sign-extends one byte, PUSH32 is
+// little-endian, the jumps sign-extend two bytes, CALL is unsigned 16-bit).
+// Only called when those bytes exist; every other opcode reads as 0.
+function imm(p:Uint8Array,i:number):number{
+  const b=p[i];
+  if(b===0x01)return (p[i+1]<<24)>>24;
+  if(b===0x02)return p[i+1]|p[i+2]<<8|p[i+3]<<16|p[i+4]<<24;
+  if(b===0x30||b===0x31||b===0x32)return ((p[i+1]|p[i+2]<<8)<<16)>>16;
+  if(b===0x33)return p[i+1]|p[i+2]<<8;
+  return 0;
+}
+
+// Binary operators on the two stack operands x (below) and y (top), with
+// the ISA's exact 32-bit semantics: Math.imul multiplication, the
+// -2^31 / -1 division edge, x % -1 == 0, unsigned DIVU/MODU/LTU, 5-bit
+// shift counts. Returns null when the operation traps instead — division
+// and modulo by zero (trap 4) — so the run loop can end the run itself.
+function binop(b:number,x:number,y:number):number|null{
+  if(b===0x10)return (x+y)|0;
+  if(b===0x11)return (x-y)|0;
+  if(b===0x12)return Math.imul(x,y);
+  if(b===0x13){if(!y)return null;return x===-2147483648&&y===-1?x:(x/y)|0}
+  if(b===0x14){if(!y)return null;return y===-1?0:x%y|0}
+  if(b===0x15){if(!y)return null;return Math.floor((x>>>0)/(y>>>0))|0}
+  if(b===0x16){if(!y)return null;return (x>>>0)%(y>>>0)|0}
+  if(b===0x18)return x&y;
+  if(b===0x19)return x|y;
+  if(b===0x1a)return x^y;
+  if(b===0x1c)return x<<(y&31);
+  if(b===0x1d)return x>>(y&31);
+  if(b===0x1e)return (x>>>(y&31))|0;
+  if(b===0x20)return x===y?1:0;
+  if(b===0x21)return x<y?1:0;
+  return (x>>>0)<(y>>>0)?1:0;
+}
+
 function run(p:Uint8Array,inp:Uint8Array):{o:Uint8Array;c:number}{
   const n=p.length,op=new Int16Array(n),ar=new Int32Array(n),
     ln=new Uint8Array(n),pp=new Uint8Array(n),qq=new Uint8Array(n);
@@ -27,13 +64,7 @@ function run(p:Uint8Array,inp:Uint8Array):{o:Uint8Array;c:number}{
     const d=T[p[i]];    // middle of an immediate decode as opcodes, as the ISA says.
     if(!d){op[i]=-1;continue}
     const L=d[0];ln[i]=L;pp[i]=d[1];qq[i]=d[2];op[i]=p[i];
-    if(i+L<n){
-      const b=p[i];
-      if(b===0x01)ar[i]=(p[i+1]<<24)>>24;
-      else if(b===0x02)ar[i]=p[i+1]|p[i+2]<<8|p[i+3]<<16|p[i+4]<<24;
-      else if(b===0x30||b===0x31||b===0x32)ar[i]=((p[i+1]|p[i+2]<<8)<<16)>>16;
-      else if(b===0x33)ar[i]=p[i+1]|p[i+2]<<8;
-    }
+    if(i+L<n)ar[i]=imm(p,i);
   }
   const D=new Int32Array(256);let sp=0;
   const C=new Int32Array(64);let cp=0;
@@ -63,23 +94,8 @@ function run(p:Uint8Array,inp:Uint8Array):{o:Uint8Array;c:number}{
       case 0x10:case 0x11:case 0x12:case 0x13:case 0x14:case 0x15:case 0x16:
       case 0x18:case 0x19:case 0x1a:case 0x1c:case 0x1d:case 0x1e:
       case 0x20:case 0x21:case 0x22:{
-        const y=D[sp-1],x=D[sp-2];let r=0;
-        if(b===0x10)r=(x+y)|0;
-        else if(b===0x11)r=(x-y)|0;
-        else if(b===0x12)r=Math.imul(x,y);
-        else if(b===0x13){if(!y)return end(4);r=x===-2147483648&&y===-1?x:(x/y)|0}
-        else if(b===0x14){if(!y)return end(4);r=y===-1?0:x%y|0}
-        else if(b===0x15){if(!y)return end(4);r=Math.floor((x>>>0)/(y>>>0))|0}
-        else if(b===0x16){if(!y)return end(4);r=(x>>>0)%(y>>>0)|0}
-        else if(b===0x18)r=x&y;
-        else if(b===0x19)r=x|y;
-        else if(b===0x1a)r=x^y;
-        else if(b===0x1c)r=x<<(y&31);
-        else if(b===0x1d)r=x>>(y&31);
-        else if(b===0x1e)r=(x>>>(y&31))|0;
-        else if(b===0x20)r=x===y?1:0;
-        else if(b===0x21)r=x<y?1:0;
-        else r=(x>>>0)<(y>>>0)?1:0;
+        const r=binop(b,D[sp-2],D[sp-1]);
+        if(r===null)return end(4);
         D[sp-2]=r;sp--;break}
       case 0x30:pc+=a;break;
       case 0x31:case 0x32:{const v=D[--sp];if((b===0x31)===(v===0))pc+=a;break}
